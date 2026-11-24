@@ -4,6 +4,9 @@
 // Wire: "0{...}" open, "2"/"3" ping/pong, "40{auth}" connect, "41" disconnect,
 // "42[id][event,...args]" event, "43id[...args]" acknowledgement.
 
+// The longest a copy of a request waits for its acknowledgement before the next goes.
+const MAX_WAIT_MS = 8000;
+
 export class SocketIo extends EventTarget {
     constructor(url, auth) {
         super();
@@ -15,6 +18,7 @@ export class SocketIo extends EventTarget {
         this.acks = new Map();
         this.handlers = new Map();
         this.closing = false;
+        this.srtt = null;             // the smoothed round trip, ms; null until an acknowledgement
     }
 
     on(event, handler) { this.handlers.set(event, handler); }
@@ -85,15 +89,53 @@ export class SocketIo extends EventTarget {
 
     // request(), sent again while the server does not answer (as Celio-Client's
     // emitWithRetry): the server drops what it already has by uuid or sequence.
-    async requestWithRetry(event, arg, { retries = 5, timeoutMs = 1000, backoffMs = 100, stop = null } = {}) {
-        for (let attempt = 1; ; attempt++) {
-            try {
-                return await this.request(event, arg, timeoutMs);
-            } catch (error) {
-                if (!this.connected || attempt > retries || stop?.()) throw error;
-                await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs * attempt, 1000)));
-            }
-        }
+    //
+    // Each copy waits twice as long as the one before (1, 2, 4, 8, 8 ... s), and every
+    // copy's acknowledgement is listened for until the last copy's wait is over, so an
+    // acknowledgement that comes late still counts. With a fixed wait shorter than the
+    // round trip, every copy timed out before its acknowledgement could arrive: on a line
+    // slower than a second each way the link never moved. The first wait is twice the
+    // smoothed round trip once one is known, never under 1 s or over 8 s; timeoutMs fixes
+    // it instead.
+    requestWithRetry(event, arg, { retries = 5, timeoutMs = null, backoffMs = 100, stop = null } = {}) {
+        const first = timeoutMs ?? Math.min(Math.max(2 * (this.srtt ?? 0), 1000), MAX_WAIT_MS);
+        return new Promise((resolve, reject) => {
+            const ids = [];
+            let done = false, attempt = 0, timer = null;
+            const finish = (settle, value) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                for (const id of ids) this.acks.delete(id);
+                settle(value);
+            };
+            const send = () => {
+                if (done) return;
+                if (!this.connected) { finish(reject, new Error('Not connected to the Server')); return; }
+                attempt++;
+                const id = this.nextAck++, sentAt = performance.now();
+                ids.push(id);
+                this.acks.set(id, {
+                    // An acknowledgement names its copy, so each one is a clean sample.
+                    resolve: (value) => { this.sampleRoundTrip(performance.now() - sentAt); finish(resolve, value); },
+                    reject: (error) => finish(reject, error),
+                });
+                this.ws.send(`42${id}${JSON.stringify([event, arg ?? null])}`);
+                timer = setTimeout(() => {
+                    if (attempt > retries || stop?.() || !this.connected) {
+                        finish(reject, new Error(this.connected ? 'The Server did not answer' : 'Disconnected'));
+                        return;
+                    }
+                    timer = setTimeout(send, Math.min(backoffMs * attempt, 1000));
+                }, Math.min(first * 2 ** (attempt - 1), MAX_WAIT_MS));
+            };
+            send();
+        });
+    }
+
+    // The smoothed round trip, as TCP keeps it: 7/8 the old, 1/8 the new.
+    sampleRoundTrip(ms) {
+        this.srtt = this.srtt === null ? ms : this.srtt * 7 / 8 + ms / 8;
     }
 
     onEvent(text) {
